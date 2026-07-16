@@ -164,6 +164,34 @@ function cwdTzPhotoToday_(tzUserId, targetDate) {
   return false;
 }
 
+// did the client send a photo in their Trainerize message thread since sinceDate?
+// covers members who snap a photo inside the TZ app chat rather than logging it
+// in the nutrition tracker.
+function cwdTzPhotoInThread_(tzUserId, sinceDate) {
+  try {
+    var th = mpa_tzPost_('message/getThreads', { userID: 3336777, view: 'byClient', clientID: Number(tzUserId), start: 0, count: 5 });
+    if (th.code !== 200 || !th.data.threads || !th.data.threads.length) return false;
+    var threadID = th.data.threads[0].threadID;
+    var cnt = mpa_tzPost_('message/getMessages', { threadID: threadID, start: 0, count: 1 });
+    var total = (cnt.code === 200 && cnt.data.totalCount) ? cnt.data.totalCount : 0;
+    var fetch = 25, startOff = Math.max(0, total - fetch);
+    var res = mpa_tzPost_('message/getMessages', { threadID: threadID, start: startOff, count: fetch });
+    if (res.code !== 200 || !res.data.messages) return false;
+    var imgPat = /\.(jpe?g|png|gif|webp|heic)(\?[^\s]*)?$/i;
+    for (var i = 0; i < res.data.messages.length; i++) {
+      var m = res.data.messages[i];
+      var senderType = (m.sender && m.sender.type) ? m.sender.type : '';
+      if (senderType === 'trainer' || senderType === 'coach') continue;
+      var at = new Date(m.sentTime || m.createdAt || 0);
+      if (sinceDate && at.getTime() < sinceDate.getTime() - 60000) continue;
+      var atts = m.attachments || m.images || m.media || [];
+      if (atts.length) return true;
+      if (imgPat.test(String(m.body || ''))) return true;
+    }
+  } catch (e) { Logger.log('[cwdTzPhotoInThread_] ' + e); }
+  return false;
+}
+
 // ---- GHL conversation fetch (lives HERE permanently; SW_swapScan + photo
 // logging depend on it). Returns {inbound:[{text,at,attachments[]}],
 // outbound:[{text,at}]} since sinceDate, or null on read failure.
@@ -186,6 +214,10 @@ function tpFetchConvo_(apiKey, contactId, sinceDate) {
     var m = msgs[i];
     var body = String(m.body || m.message || '').trim();
     var atts = m.attachments || [];
+    // GHL MMS: photo URL sometimes arrives in body text instead of attachments[]
+    if (!atts.length && /\bhttps?:\/\/\S+\.(?:jpe?g|png|gif|webp|heic)(?:\?[^\s]*)?\b/i.test(body)) {
+      atts = [body.match(/\bhttps?:\/\/\S+\.(?:jpe?g|png|gif|webp|heic)(?:\?[^\s]*)?\b/i)[0]];
+    }
     if (!body && !atts.length) continue;
     var added = m.dateAdded || m.dateUpdated || m.createdAt;
     var at = added ? new Date(added) : null;
@@ -355,9 +387,9 @@ function CW_doneRun(action, cls, dayOffset, dryRun) {
     var photoOk = null;   // null = not a photo cue
     var photoVia = '';
     if (photo) {
-      // Trainerize meal tracker first, then GHL-texted photos (interim channel
-      // until members are moved back into the TZ app)
+      // Check all photo channels: TZ nutrition tracker, TZ chat thread, GHL SMS/MMS
       if (tzId && cwdTzPhotoToday_(tzId, target)) { photoOk = true; photoVia = 'tz'; }
+      else if (tzId && cwdTzPhotoInThread_(tzId, since)) { photoOk = true; photoVia = 'tz-chat'; }
       else if (cwdGhlPhotosSince_(apiKey, contactId, since).length) { photoOk = true; photoVia = 'ghl'; }
       else photoOk = false;
       if (!hit && photoOk) { hit = { at: now }; via = 'photo upload'; }   // the photo itself proves the habit
@@ -372,9 +404,9 @@ function CW_doneRun(action, cls, dayOffset, dryRun) {
         dc.getRange(sheetRow, DONE_CFG.autoCols.lastDone).setValue(hit.at || now);
         dc.getRange(sheetRow, DONE_CFG.autoCols.lastCheck).setValue(now);
         dc.getRange(sheetRow, DONE_CFG.autoCols.status).setValue('DONE received (' + cls + ' via ' + (via || 'sms') + (needPhotoNudge ? ', no photo' : '') + ')');
-        // acknowledge; if their cue includes a photo and none was uploaded, fold the photo ask into the ack
+        // acknowledge; if their cue includes a photo and none was found, fold the ask into the ack
         var ackMsg = needPhotoNudge
-          ? cwdAckMsg_(first) + ' One thing: I didnt see your meal photo in the app yet, get that uploaded for me too.'
+          ? cwdAckMsg_(first) + ' One thing: I didnt see a meal photo come through — send one with your DONE next time.'
           : cwdAckMsg_(first);
         var ak = ackInApp ? cwdTzSendMsg_(tzId, ackMsg) : doneSendGhlSms_(apiKey, contactId, ackMsg);
         if (ackInApp && !ak.success) ak = doneSendGhlSms_(apiKey, contactId, ackMsg);   // app send failed -> fall back to SMS
